@@ -5,12 +5,12 @@ A small Bash tool to install and update the latest stable [Helix](https://helix-
 ## Features
 
 - Install the latest stable release into `~/.local/opt/helix-<version>`
-- Verifies teh SHA-256 digest published by GitHUb (when available), the archive, and that the binary reports the expected version
-- Atomic switching via symliks: an interrupted update never leaves a broken install
+- Verifies the SHA-256 digest published by GitHUb (when available), the archive, and that the binary reports the expected version
+- Atomic switching via symlinks: an interrupted update never leaves a broken install
 - `--rollback` swap between the current and previous version
-- Keeps the last 3 versions and removes olders ones
+- Keeps the last 3 versions and removes older ones
 - Supports `x86_64` and `aarch64` Linux
-- Sage against concurrent runs (`flock`)
+- Save against concurrent runs (`flock`)
 
 ## Requirements
 
