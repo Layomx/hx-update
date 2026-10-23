@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+#
+# hx-update - install and manage upstream Helix releases under ~/.local
+#
+set -Eeuo pipefail
+
+readonly VERSION="1.0.0"
+readonly REPO="helix-editor/helix"
+readonly BASE="${HX_UPDATE_BASE:-$HOME/.local/opt}"
+readonly BIN="${HX_UPDATE_BIN:-$HOME/.local/bin}"
+readonly NAME="${HX_UPDATE_NAME:-hx}"
+readonly KEEP="${HX_UPDATE_KEEP:-3}"
+readonly CURRENT="$BASE/helix-current"
+readonly PREVIOUS="$BASE/helix-previous"
+readonly LOCKFILE="$BASE/.hx-update.lock"
+
+MODE="install"
+FORCE=0
+tmp=""
+
+# Helpers
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+    if [[ -n "$tmp" && -d "$tmp" ]]; then
+        rm -rf -- "$tmp"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+usage() {
+    cat <<EOT
+hx-update $VERSION - install and manage upstream Helix releases
+
+Usage: hx-update [OPTION]
+
+Options:
+  (none)        Install the latest stable release if it is newer
+  --check       Only report whether an update is available
+                (exit 0 = up to date, 10 = update available)
+  --force       Reinstall the latest release even if already installed
+  --rollback    Swap back to the previously active version
+  --list        List installed versions
+  --version     Print the hx-update version
+  -h, --help    Show this help
+
+Environment:
+  GITHUB_TOKEN      Optional; raises the GitHub API rate limit
+  HX_UPDATE_BASE    Install directory   (default: ~/.local/opt)
+  HX_UPDATE_BIN     Symlink directory   (default: ~/.local/bin)
+  HX_UPDATE_NAME    Symlink name        (default: hx)
+  HX_UPDATE_KEEP    Versions to keep    (default: 3)
+EOT
+}
+
+# Atomically (re)point symlink $2 at $1.
+set_link() {
+    local target="$1" link="$2" staging
+    staging="${link}.tmp.$$"
+    ln -s "$target" "$staging"
+    mv -Tf "$staging" "$link"
+}
+
+resolve() { readlink -f -- "$1" 2>/dev/null || true; }
+
+installed_tag() {
+    local dir name
+    [[ -L "$CURRENT" ]] || return 0
+    dir="$(resolve "$CURRENT")"
+    name="${dir##*/}"
+    printf '%s\n' "${name#helix-}"
+}
+
+is_valid_install() {
+    [[ -x "$1/hx" && -d "$1/runtime" ]] && "$1/hx" --version >/dev/null 2>&1
+}
+
+check_requirements() {
+    local missing=() cmd
+    [[ "$(uname -s)" == "Linux" ]] || die "hx-update only supports Linux."
+    for cmd in curl jq tar xz flock sha256sum find sort; do
+        command -v "$cmd" >/dev/null || missing+=("$cmd")
+    done
+    if ((${#missing[@]})); then
+        die "Missing: ${missing[*]}. On Debian/Ubuntu: sudo apt install curl jq xz-utils util-linux"
+    fi
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  ARCH="x86_64" ;;
+        aarch64|arm64) ARCH="aarch64" ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+fetch_release() {
+    local auth=()
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    fi
+    curl -fsSL --max-time 30 "${auth[@]}" \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        "https://api.github.com/repos/$REPO/releases/latest" ||
+        die "Could not query the GitHub API (network or rate limit?). Set GITHUB_TOKEN to raise the limit."
+}
+
+# COMMANDS
+
+list_versions() {
+    local cur prev dir mark found=0
+    cur="$(resolve "$CURRENT")"
+    prev="$(resolve "$PREVIOUS")"
+    [[ -d "$BASE" ]] || { info "No versions installed."; return 0; }
+    while IFS= read -r dir; do
+        mark=""
+        if [[ "$dir" == "$cur" ]]; then mark=" (current)"; fi
+        if [[ "$dir" == "$prev" ]]; then mark=" (previous)"; fi
+        printf '%s%s\n' "${dir##*/helix-}" "$mark"
+        found=1
+    done < <(find "$BASE" -mindepth 1 -maxdepth 1 -type d -name 'helix-[0-9]*' | sort -V)
+    if ((! found)); then info "No versions installed."; fi
+}
+
+rollback() {
+    local cur old
+    [[ -L "$CURRENT" ]]  || die "No active version."
+    [[ -L "$PREVIOUS" ]] || die "No previous version saved."
+    cur="$(resolve "$CURRENT")"
+    old="$(resolve "$PREVIOUS")"
+    [[ -x "$old/hx" ]] || die "Previous executable no longer exists: $old"
+
+    # Swap, so a second rollback goes forward again.
+    set_link "$old" "$CURRENT"
+    set_link "$cur" "$PREVIOUS"
+
+    printf 'Helix restored: '
+    "$CURRENT/hx" --version
+}
+
+prune() {
+    local cur prev dir total
+    local dirs=()
+    cur="$(resolve "$CURRENT")"
+    prev="$(resolve "$PREVIOUS")"
+    mapfile -t dirs < <(find "$BASE" -mindepth 1 -maxdepth 1 -type d -name 'helix-[0-9]*' | sort -V)
+    total=${#dirs[@]}
+    ((total > KEEP)) || return 0
+    for dir in "${dirs[@]:0:total-KEEP}"; do
+        if [[ "$dir" == "$cur" || "$dir" == "$prev" ]]; then continue; fi
+        info "Removing old version: ${dir##*/helix-}"
+        rm -rf -- "$dir"
+    done
+}
+
+link_binary() {
+    local link="$BIN/$NAME" resolved
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        warn "$link exists and is not a symlink; leaving it alone."
+        return 0
+    fi
+    set_link "$CURRENT/hx" "$link"
+
+    case ":$PATH:" in
+        *":$BIN:"*) ;;
+        *) warn "$BIN is not in your PATH." ;;
+    esac
+    resolved="$(command -v "$NAME" || true)"
+    if [[ -n "$resolved" && "$resolved" != "$link" ]]; then
+        warn "'$NAME' currently resolves to $resolved (PATH order). Put $BIN first in PATH."
+    fi
+}
+
+activate() {
+    local target="$1" tag="$2" active=""
+    if [[ -L "$CURRENT" ]]; then active="$(resolve "$CURRENT")"; fi
+
+    if [[ "$active" == "$target" ]]; then
+        info "Helix $tag is already the active version."
+    else
+        if [[ -n "$active" ]]; then set_link "$active" "$PREVIOUS"; fi
+        set_link "$target" "$CURRENT"
+    fi
+
+    link_binary
+    prune
+
+    info
+    info "Done."
+    "$CURRENT/hx" --version
+    info "Runtime:  $CURRENT/runtime"
+    info "Rollback: hx-update --rollback"
+}
+
+install_latest() {
+    local release tag asset asset_json url digest target current
+    local archive expected actual extracted
+
+    info "Querying latest stable Helix release..."
+    release="$(fetch_release)"
+    tag="$(jq -er '.tag_name' <<<"$release")" || die "Could not read the release tag."
+    [[ "$tag" =~ ^[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]] || die "Unexpected version tag: $tag"
+
+    current="$(installed_tag)"
+    if [[ "$MODE" == "check" ]]; then
+        info "Installed: ${current:-none}"
+        info "Latest:    $tag"
+        if [[ "$current" == "$tag" ]]; then
+            info "Up to date."
+            exit 0
+        fi
+        info "Update available."
+        exit 10
+    fi
+
+    asset="helix-${tag}-${ARCH}-linux.tar.xz"
+    asset_json="$(jq -ce --arg n "$asset" '.assets[] | select(.name == $n)' <<<"$release")" ||
+        die "Release $tag has no asset named $asset."
+    url="$(jq -er '.browser_download_url' <<<"$asset_json")"
+    digest="$(jq -r '.digest // empty' <<<"$asset_json")"
+
+    target="$BASE/helix-$tag"
+
+    if ((! FORCE)) && is_valid_install "$target"; then
+        info "Helix $tag is already installed."
+    else
+        # Work inside $BASE so the final mv is an atomic rename.
+        tmp="$(mktemp -d -p "$BASE" .hx-update.XXXXXX)"
+        archive="$tmp/helix.tar.xz"
+
+        info "Downloading Helix $tag ($ARCH)..."
+        curl -fL --retry 3 --progress-bar -o "$archive" "$url" ||
+            die "Download failed."
+
+        info "Verifying..."
+        if [[ "$digest" == sha256:* ]]; then
+            expected="${digest#sha256:}"
+            actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+            [[ "$actual" == "$expected" ]] ||
+                die "SHA-256 mismatch (expected $expected, got $actual)."
+            info "SHA-256 OK."
+        else
+            warn "GitHub did not provide a checksum for this asset; skipping SHA-256 check."
+        fi
+        tar -tf "$archive" >/dev/null || die "Archive is corrupt."
+
+        mkdir "$tmp/extract"
+        tar -xf "$archive" -C "$tmp/extract"
+
+        extracted="$(find "$tmp/extract" -mindepth 2 -maxdepth 2 -type f -name hx -printf '%h\n' -quit)"
+        [[ -n "$extracted" && -x "$extracted/hx" ]] || die "No hx executable found in the archive."
+        [[ -d "$extracted/runtime" ]] || die "Archive does not contain the expected runtime directory."
+
+        actual="$("$extracted/hx" --version)"
+        grep -Fq "$tag" <<<"$actual" || die "Executable version does not match $tag: $actual"
+
+        # Move any leftover/partial/forced directory out of the way.
+        if [[ -e "$target" ]]; then mv -T "$target" "$tmp/old"; fi
+        mv -T "$extracted" "$target"
+    fi
+
+    is_valid_install "$target" || die "Installed executable does not run."
+    activate "$target" "$tag"
+}
+
+# main section
+# 
+while (($#)); do
+    case "$1" in
+        --check)    MODE="check" ;;
+        --force)    FORCE=1 ;;
+        --rollback) MODE="rollback" ;;
+        --list)     MODE="list" ;;
+        --version)  info "hx-update $VERSION"; exit 0 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          die "Unknown option: $1 (see --help)" ;;
+    esac
+    shift
+done
+
+[[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die "HX_UPDATE_KEEP must be a positive integer."
+
+if [[ "$MODE" == "list" ]]; then
+    list_versions
+    exit 0
+fi
+
+if [[ "$MODE" != "rollback" ]]; then
+    check_requirements
+    detect_arch
+fi
+
+mkdir -p "$BASE" "$BIN"
+
+# Prevent concurrent runs.
+exec 9>"$LOCKFILE"
+flock -n 9 || die "Another hx-update is already running."
+
+case "$MODE" in
+    rollback) rollback ;;
+    *)        install_latest ;;
+esac
