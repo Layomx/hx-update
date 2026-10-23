@@ -5,12 +5,12 @@ A small Bash tool to install and update the latest stable [Helix](https://helix-
 ## Features
 
 - Install the latest stable release into `~/.local/opt/helix-<version>`
-- Verifies the SHA-256 digest published by GitHUb (when available), the archive, and that the binary reports the expected version
+- Verifies the SHA-256 digest published by GitHub (when available), the archive, and that the binary reports the expected version
 - Atomic switching via symlinks: an interrupted update never leaves a broken install
-- `--rollback` swap between the current and previous version
+- `--rollback` swaps between the current and previous version
 - Keeps the last 3 versions and removes older ones
 - Supports `x86_64` and `aarch64` Linux
-- Save against concurrent runs (`flock`)
+- Safe against concurrent runs (`flock`)
 
 ## Requirements
 
@@ -25,8 +25,8 @@ sudo apt install curl jq xz-utils util-linux
 ## Install
 
 ```bash
-git clone https://github.com/Layomx/helix-updater.git
-cd hx-updater
+git clone https://github.com/Layomx/helix-update.git
+cd hx-update
 ./install.sh
 ```
 
@@ -34,8 +34,8 @@ Or just download the script:
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL -0 ~/.local/bin/hx-update \
-  https://raw.githubusercontent.com/Layomx/hx-updater/main/hx-update
+curl -fsSL -o ~/.local/bin/hx-update \
+  https://raw.githubusercontent.com/Layomx/hx-update/main/hx-update
 chmod +x ~/.local/bin/hx-update
 ```
 
